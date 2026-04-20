@@ -1,0 +1,412 @@
+const { 
+  Client, 
+  GatewayIntentBits, 
+  ActionRowBuilder, 
+  ButtonBuilder, 
+  ButtonStyle,
+  ModalBuilder,
+  TextInputBuilder,
+  TextInputStyle,
+  ChannelType, 
+  PermissionsBitField,
+  EmbedBuilder,
+  SlashCommandBuilder,
+  REST,
+  Routes
+} = require('discord.js');
+const fs = require('fs');
+const path = require('path');
+
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.DirectMessages,
+    GatewayIntentBits.GuildMembers
+  ]
+});
+
+// ========== CONFIGURATION ==========
+const CONFIG = {
+  OWNER_ID: '1282001169274638376',
+  MM_REQUEST_CHANNEL_ID: '1495875860882788446',
+  SUPPORT_REQUEST_CHANNEL_ID: '1495875912065880114',
+  TICKET_CATEGORY_ID: '1495875860882788446',
+  SUPPORT_CATEGORY_ID: '1495875912065880114',
+  LOGS_CHANNEL_ID: '',
+};
+
+// ========== STORAGE ==========
+const DATA_FILE = path.join(__dirname, 'ticket_data.json');
+let activeTickets = new Map();
+let ticketFees = new Map();
+
+function loadData() {
+  try {
+    if (fs.existsSync(DATA_FILE)) {
+      const data = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
+      if (data.activeTickets) {
+        for (const [key, value] of Object.entries(data.activeTickets)) {
+          activeTickets.set(key, value);
+        }
+      }
+      console.log(`✅ Loaded ${activeTickets.size} active tickets`);
+    }
+  } catch (error) { console.log('Error loading data:', error); }
+}
+
+function saveData() {
+  try {
+    const data = { activeTickets: Object.fromEntries(activeTickets), lastUpdated: new Date().toISOString() };
+    fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
+  } catch (error) { console.log('Error saving data:', error); }
+}
+
+async function sendLog(title, description, color = 0x9b59b6, fields = []) {
+  const logChannel = client.channels.cache.get(CONFIG.LOGS_CHANNEL_ID);
+  if (!logChannel) return;
+  const embed = new EmbedBuilder().setTitle(title).setDescription(description).setColor(color).setTimestamp();
+  fields.forEach(f => embed.addFields({ name: f.name, value: f.value, inline: f.inline || false }));
+  await logChannel.send({ embeds: [embed] }).catch(() => { });
+}
+
+async function createTicket(interaction, type, targetId = null) {
+  const ticketNum = Math.floor(Math.random() * 9000) + 1000;
+  const channelName = `${type === 'mm' ? 'mm' : 'support'}-${interaction.user.username}-${ticketNum}`;
+  const targetUser = targetId ? await interaction.guild.members.fetch(targetId).catch(() => null) : null;
+  const categoryId = type === 'mm' ? CONFIG.TICKET_CATEGORY_ID : CONFIG.SUPPORT_CATEGORY_ID;
+  const adminRole = interaction.guild.roles.cache.find(r => r.permissions.has(PermissionsBitField.Flags.Administrator));
+  
+  const channel = await interaction.guild.channels.create({
+    name: channelName,
+    type: ChannelType.GuildText,
+    parent: categoryId,
+    permissionOverwrites: [
+      { id: interaction.guild.id, deny: [PermissionsBitField.Flags.ViewChannel] },
+      { id: interaction.user.id, allow: [PermissionsBitField.Flags.ViewChannel, PermissionsBitField.Flags.SendMessages, PermissionsBitField.Flags.ReadMessageHistory] }
+    ]
+  });
+  
+  if (targetUser) {
+    await channel.permissionOverwrites.create(targetUser.id, {
+      ViewChannel: true, SendMessages: true, ReadMessageHistory: true
+    });
+  }
+  
+  if (adminRole) {
+    await channel.permissionOverwrites.create(adminRole, {
+      ViewChannel: true, SendMessages: true, ReadMessageHistory: true
+    });
+  }
+  
+  activeTickets.set(channel.id, { type, userId: interaction.user.id, targetId, createdAt: Date.now() });
+  saveData();
+  
+  const embed = new EmbedBuilder()
+    .setTitle(`🛡️ ${type === 'mm' ? 'Middleman Request' : 'Support Ticket'} #${ticketNum}`)
+    .setColor(type === 'mm' ? 0x9b59b6 : 0x00aaff)
+    .setDescription(`${type === 'mm' ? 'A middleman will assist you shortly.' : 'A support staff member will assist you shortly.'}`)
+    .addFields(
+      { name: '📤 Requested By', value: interaction.user.tag, inline: true },
+      ...(targetUser ? [{ name: '📥 Trading With', value: targetUser.user.tag, inline: true }] : [])
+    )
+    .setFooter({ text: `Ticket Type: ${type.toUpperCase()} | Only admins can see this ticket` })
+    .setTimestamp();
+  
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`close_ticket_${channel.id}`).setLabel('🔒 Close Ticket').setStyle(ButtonStyle.Danger)
+  );
+  
+  await channel.send({ content: `${interaction.user} ${targetUser ? targetUser : ''}`, embeds: [embed], components: [row] });
+  await sendLog('✅ Ticket Created', `${type.toUpperCase()} ticket created by ${interaction.user.tag}`, 0x00ff00, [
+    { name: 'Channel', value: `<#${channel.id}>`, inline: true },
+    ...(targetUser ? [{ name: 'Trading With', value: targetUser.user.tag, inline: true }] : [])
+  ]);
+  return channel;
+}
+
+async function sendTicketPanel(channel, type) {
+  const embed = new EmbedBuilder()
+    .setTitle(`🛡️ ${type === 'mm' ? 'Middleman Request' : 'Support Ticket'}`)
+    .setColor(type === 'mm' ? 0x9b59b6 : 0x00aaff)
+    .setDescription(`Click the button below to create a ${type === 'mm' ? 'Middleman' : 'Support'} ticket.\n\n⚠️ **Note:** Only server admins can see and respond to tickets.`)
+    .setFooter({ text: `${type === 'mm' ? 'MM' : 'Support'} System` });
+  
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`${type}_ticket_btn`).setLabel(`📩 Create ${type === 'mm' ? 'MM' : 'Support'} Ticket`).setStyle(ButtonStyle.Primary)
+  );
+  await channel.send({ embeds: [embed], components: [row] });
+}
+
+// ========== OWNER COMMANDS ==========
+client.on('messageCreate', async message => {
+  if (message.author.bot) return;
+  if (message.author.id !== CONFIG.OWNER_ID) return;
+  if (message.content === '!panel') {
+    const mmChannel = client.channels.cache.get(CONFIG.MM_REQUEST_CHANNEL_ID);
+    const supportChannel = client.channels.cache.get(CONFIG.SUPPORT_REQUEST_CHANNEL_ID);
+    if (mmChannel) await sendTicketPanel(mmChannel, 'mm');
+    if (supportChannel) await sendTicketPanel(supportChannel, 'support');
+    await message.reply('✅ Panels sent!');
+  }
+});
+
+// ========== $add COMMAND ==========
+client.on('messageCreate', async message => {
+  if (message.author.bot) return;
+  if (!message.content.startsWith('$add')) return;
+  
+  if (!message.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
+    return message.reply('❌ Only admins can use this command!');
+  }
+  
+  if (!message.channel.name?.startsWith('mm-') && !message.channel.name?.startsWith('support-')) {
+    return message.reply('❌ This command can only be used in ticket channels!');
+  }
+  
+  const args = message.content.split(' ');
+  const target = message.mentions.users.first();
+  
+  if (!target) {
+    return message.reply('❌ Usage: `$add @user`');
+  }
+  
+  await message.channel.permissionOverwrites.create(target.id, {
+    ViewChannel: true, SendMessages: true, ReadMessageHistory: true
+  });
+  
+  await message.reply(`✅ Added ${target} to this ticket!`);
+  await sendLog('👤 User Added to Ticket', `${target.tag} was added to ${message.channel.name} by ${message.author.tag}`, 0x00ff00);
+});
+
+// ========== $fee COMMAND ==========
+client.on('messageCreate', async message => {
+  if (message.author.bot) return;
+  if (!message.content.startsWith('$fee')) return;
+  
+  if (!message.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
+    return message.reply('❌ Only admins can use this command!');
+  }
+  
+  if (!message.channel.name?.startsWith('mm-') && !message.channel.name?.startsWith('support-')) {
+    return message.reply('❌ This command can only be used in ticket channels!');
+  }
+  
+  const args = message.content.split(' ');
+  const amount = parseFloat(args[1]);
+  
+  if (isNaN(amount) || amount <= 0) {
+    return message.reply('❌ Usage: `$fee <amount>`\nExample: `$fee 25`');
+  }
+  
+  ticketFees.set(message.channel.id, { amount, confirmedBy: [] });
+  
+  const embed = new EmbedBuilder()
+    .setTitle('💰 Fee Confirmation Required')
+    .setColor(0xff9900)
+    .setDescription(`**Fee Amount:** $${amount.toFixed(2)} USD\n\nBoth parties must click the confirm button below to accept this fee.`)
+    .setFooter({ text: 'Both parties must confirm before proceeding' })
+    .setTimestamp();
+  
+  const row = new ActionRowBuilder().addComponents(
+    new ButtonBuilder().setCustomId(`confirm_fee_${message.channel.id}`).setLabel('✅ Confirm Fee').setStyle(ButtonStyle.Success)
+  );
+  
+  await message.channel.send({ embeds: [embed], components: [row] });
+  await message.reply(`✅ Fee of $${amount.toFixed(2)} set! Waiting for both parties to confirm.`);
+});
+
+// ========== $conf COMMAND ==========
+client.on('messageCreate', async message => {
+  if (message.author.bot) return;
+  if (!message.content.startsWith('$conf')) return;
+  
+  if (!message.channel.name?.startsWith('mm-') && !message.channel.name?.startsWith('support-')) {
+    return message.reply('❌ This command can only be used in ticket channels!');
+  }
+  
+  const ticketData = activeTickets.get(message.channel.id);
+  if (!ticketData) {
+    return message.reply('❌ Ticket data not found!');
+  }
+  
+  const isRequester = message.author.id === ticketData.userId;
+  const isTarget = message.author.id === ticketData.targetId;
+  
+  if (!isRequester && !isTarget) {
+    return message.reply('❌ Only the ticket creator and the person they are trading with can confirm!');
+  }
+  
+  const feeData = ticketFees.get(message.channel.id);
+  if (!feeData) {
+    return message.reply('❌ No fee has been set yet! An admin needs to use `$fee <amount>` first.');
+  }
+  
+  if (feeData.confirmedBy.includes(message.author.id)) {
+    return message.reply('❌ You have already confirmed the fee!');
+  }
+  
+  feeData.confirmedBy.push(message.author.id);
+  ticketFees.set(message.channel.id, feeData);
+  
+  await message.reply(`✅ ${message.author} has confirmed the fee! (${feeData.confirmedBy.length}/2 confirmed)`);
+  
+  if (feeData.confirmedBy.length >= 2) {
+    const confirmEmbed = new EmbedBuilder()
+      .setTitle('✅ Fee Confirmed by Both Parties!')
+      .setColor(0x00ff00)
+      .setDescription(`**Fee Amount:** $${feeData.amount.toFixed(2)} USD\n\nBoth parties have confirmed the fee. You may now proceed with the trade.`)
+      .setTimestamp();
+    
+    await message.channel.send({ embeds: [confirmEmbed] });
+    await sendLog('✅ Fee Confirmed', `Fee of $${feeData.amount} confirmed for ticket ${message.channel.name}`, 0x00ff00);
+  }
+});
+
+// ========== BUTTON HANDLERS ==========
+client.on('interactionCreate', async interaction => {
+  if (!interaction.isButton()) return;
+  
+  if (interaction.customId === 'mm_ticket_btn') {
+    const modal = new ModalBuilder().setCustomId(`mm_modal_${interaction.user.id}`).setTitle('Middleman Request');
+    modal.addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId('target').setLabel("Who are you trading with? (Username or ID)").setStyle(TextInputStyle.Short).setPlaceholder('@username or Discord ID').setRequired(true)
+      )
+    );
+    await interaction.showModal(modal);
+  }
+  
+  if (interaction.customId === 'support_ticket_btn') {
+    const modal = new ModalBuilder().setCustomId(`support_modal_${interaction.user.id}`).setTitle('Support Request');
+    modal.addComponents(
+      new ActionRowBuilder().addComponents(
+        new TextInputBuilder().setCustomId('issue').setLabel('What do you need help with?').setStyle(TextInputStyle.Paragraph).setPlaceholder('Describe your issue...').setRequired(true)
+      )
+    );
+    await interaction.showModal(modal);
+  }
+  
+  if (interaction.customId.startsWith('close_ticket_')) {
+    const id = interaction.customId.split('_')[2];
+    await interaction.reply({ content: '🔒 Closing ticket in 5 seconds...', flags: 64 });
+    setTimeout(async () => {
+      const ch = await client.channels.fetch(id);
+      if (ch) await ch.delete();
+      activeTickets.delete(id);
+      ticketFees.delete(id);
+      saveData();
+    }, 5000);
+  }
+  
+  if (interaction.customId.startsWith('confirm_fee_')) {
+    const channelId = interaction.customId.split('_')[2];
+    const channel = await client.channels.fetch(channelId);
+    const ticketData = activeTickets.get(channelId);
+    
+    if (!ticketData) {
+      return interaction.reply({ content: '❌ Ticket data not found!', flags: 64 });
+    }
+    
+    const isRequester = interaction.user.id === ticketData.userId;
+    const isTarget = interaction.user.id === ticketData.targetId;
+    
+    if (!isRequester && !isTarget) {
+      return interaction.reply({ content: '❌ Only the ticket creator and the person they are trading with can confirm the fee!', flags: 64 });
+    }
+    
+    const feeData = ticketFees.get(channelId);
+    if (!feeData) {
+      return interaction.reply({ content: '❌ No fee has been set yet! An admin needs to use `$fee <amount>` first.', flags: 64 });
+    }
+    
+    if (feeData.confirmedBy.includes(interaction.user.id)) {
+      return interaction.reply({ content: '❌ You have already confirmed the fee!', flags: 64 });
+    }
+    
+    feeData.confirmedBy.push(interaction.user.id);
+    ticketFees.set(channelId, feeData);
+    
+    await interaction.reply({ content: `✅ ${interaction.user} has confirmed the fee! (${feeData.confirmedBy.length}/2 confirmed)`, flags: 64 });
+    
+    if (feeData.confirmedBy.length >= 2) {
+      const confirmEmbed = new EmbedBuilder()
+        .setTitle('✅ Fee Confirmed by Both Parties!')
+        .setColor(0x00ff00)
+        .setDescription(`**Fee Amount:** $${feeData.amount.toFixed(2)} USD\n\nBoth parties have confirmed the fee. You may now proceed with the trade.`)
+        .setTimestamp();
+      
+      await channel.send({ embeds: [confirmEmbed] });
+      await sendLog('✅ Fee Confirmed', `Fee of $${feeData.amount} confirmed for ticket ${channel.name}`, 0x00ff00);
+    }
+  }
+});
+
+// ========== MODAL SUBMISSIONS ==========
+client.on('interactionCreate', async interaction => {
+  if (!interaction.isModalSubmit()) return;
+  
+  if (interaction.customId.startsWith('mm_modal_')) {
+    await interaction.deferReply({ flags: 64 });
+    const targetInput = interaction.fields.getTextInputValue('target');
+    let targetId = null;
+    
+    const match = targetInput.match(/\d{17,19}/);
+    if (match) {
+      try { const user = await client.users.fetch(match[0]); targetId = user.id; } catch (e) { }
+    } else {
+      const members = await interaction.guild.members.fetch();
+      const found = members.find(m => m.user.username.toLowerCase() === targetInput.toLowerCase() || m.displayName.toLowerCase() === targetInput.toLowerCase());
+      if (found) targetId = found.id;
+    }
+    
+    if (!targetId) return interaction.editReply('❌ User not found! Make sure you typed their username or ID correctly.');
+    
+    const channel = await createTicket(interaction, 'mm', targetId);
+    await interaction.editReply(`✅ MM ticket created! ${channel}`);
+  }
+  
+  if (interaction.customId.startsWith('support_modal_')) {
+    await interaction.deferReply({ flags: 64 });
+    const issue = interaction.fields.getTextInputValue('issue');
+    const channel = await createTicket(interaction, 'support');
+    await interaction.editReply(`✅ Support ticket created! ${channel}`);
+    await channel.send({ content: `📝 **Issue:** ${issue}` });
+  }
+});
+
+// ========== READY EVENT ==========
+client.once('ready', async () => {
+  console.log(`✅ Brainrot MM Bot online as ${client.user.tag}`);
+  loadData();
+  client.user.setPresence({ activities: [{ name: '$fee | $add | $conf', type: 3 }], status: 'online' });
+  
+  const rest = new REST({ version: '10' }).setToken(client.token);
+  await rest.put(Routes.applicationCommands(client.user.id), { body: [
+    new SlashCommandBuilder().setName('close').setDescription('Close current ticket (Admin only)')
+  ] });
+});
+
+// ========== SLASH COMMANDS ==========
+client.on('interactionCreate', async interaction => {
+  if (!interaction.isCommand()) return;
+  if (interaction.commandName === 'close') {
+    if (!interaction.memberPermissions.has(PermissionsBitField.Flags.Administrator)) {
+      return interaction.reply({ content: '❌ Only admins can close tickets!', flags: 64 });
+    }
+    if (!interaction.channel.name?.startsWith('mm-') && !interaction.channel.name?.startsWith('support-')) {
+      return interaction.reply({ content: '❌ Use this in a ticket channel!', flags: 64 });
+    }
+    await interaction.reply('🔒 Closing ticket in 5 seconds...');
+    setTimeout(() => interaction.channel.delete(), 5000);
+  }
+});
+// ========== LOGIN ==========
+const token = process.env.DISCORD_TOKEN;
+if (!token) {
+  console.error('❌ DISCORD_TOKEN not found in environment variables!');
+  process.exit(1);
+}
+client.login(token);
+client.login(TOKEN);
