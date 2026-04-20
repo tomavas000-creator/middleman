@@ -402,6 +402,7 @@ client.on('interactionCreate', async interaction => {
     setTimeout(() => interaction.channel.delete(), 5000);
   }
 });
+
 // ========== LOGIN ==========
 const token = process.env.DISCORD_TOKEN;
 if (!token) {
@@ -409,4 +410,3 @@ if (!token) {
   process.exit(1);
 }
 client.login(token);
-client.login(TOKEN);
